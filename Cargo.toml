@@ -3,6 +3,11 @@ name = "backout"
 version = "0.1.0"
 edition = "2024"
 description = "Run async steps with retries and exponential backoff, undoing completed steps if later steps fail"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/vrindisbacher/backout"
+readme = "README.md"
+keywords = ["retry", "backoff", "async", "rollback", "saga"]
+categories = ["asynchronous"]
 
 [dependencies]
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
