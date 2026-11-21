@@ -33,25 +33,16 @@ pub enum TransactionError<E> {
 impl<E: fmt::Display> fmt::Display for TransactionError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TransactionError::Step { .. } => write!(f, "step failed"),
-            TransactionError::Rollback { undo, .. } => {
-                write!(f, "step failed; {} undo(s) also failed", undo.len())
+            TransactionError::Step { error } => write!(f, "step failed: {error}"),
+            TransactionError::Rollback { step, undo } => {
+                write!(f, "step failed: {step}; {} undo(s) also failed", undo.len())
             }
             TransactionError::Aborted {} => write!(f, "transaction aborted"),
         }
     }
 }
 
-impl<E: Error + 'static> Error for TransactionError<E> {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            TransactionError::Step { error: e } | TransactionError::Rollback { step: e, .. } => {
-                Some(e)
-            }
-            TransactionError::Aborted {} => None,
-        }
-    }
-}
+impl<E: fmt::Debug + fmt::Display> Error for TransactionError<E> {}
 
 fn backoff_duration(num_retries: i32) -> Duration {
     let base: f64 = 2.0;
