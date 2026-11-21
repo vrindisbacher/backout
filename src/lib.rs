@@ -83,7 +83,11 @@ where
 struct Undo<'env> {
     handler: UndoFn<'env, UndoError>,
     max_retries: u32,
+    exhausted: Option<ExhaustedFn<'env>>,
 }
+
+/// Hook that runs once every retry of an undo has failed
+type ExhaustedFn<'env> = Box<dyn FnOnce() -> BoxFuture<'env, ()> + Send + 'env>;
 
 /// Step: one operation of a transaction, retried with exponential backoff
 ///
@@ -117,30 +121,52 @@ impl<'transaction, 'env, Op> Step<'transaction, 'env, Op> {
     }
 
     /// Register an undo handler to unwind this op if a later one fails
-    pub fn undo<U, Fut>(self, mut on_failure: U) -> StepWithUndo<'transaction, 'env, Op>
+    ///
+    /// The handler receives a clone of the result of the step on every call
+    pub fn undo<R, U, Fut>(self, mut on_failure: U) -> StepWithUndo<'transaction, 'env, Op, R>
     where
-        U: FnMut() -> Fut + Send + 'env,
+        R: Clone + Send + 'env,
+        U: FnMut(R) -> Fut + Send + 'env,
         Fut: Future<Output = Result<(), UndoError>> + Send + 'env,
     {
-        // erase the closure's type (and its future's type) so undos have the same type
-        let handler: UndoFn<'env, UndoError> = Box::new(move || Box::pin(on_failure()));
+        let make: MakeUndo<'env, R> = Box::new(move |result: &R| {
+            let result = result.clone();
+            // erase the closure's type (and its future's type) so undos have the same type
+            let handler: UndoFn<'env, UndoError> =
+                Box::new(move || Box::pin(on_failure(result.clone())));
+            handler
+        });
         StepWithUndo {
             step: self,
-            undo: Undo {
-                handler,
+            undo: UndoSpec {
+                make,
                 max_retries: 0,
+                exhausted: None,
             },
         }
     }
 }
 
-/// StepWithUndo: a `Step` with an undo handler to unwind operations when later steps fail
-pub struct StepWithUndo<'transaction, 'env, Op> {
-    step: Step<'transaction, 'env, Op>,
-    undo: Undo<'env>,
+/// Builds the undo handler once the step's result is known
+type MakeUndo<'env, R> = Box<dyn FnOnce(&R) -> UndoFn<'env, UndoError> + Send + 'env>;
+
+/// An undo handler waiting for the result of its step
+struct UndoSpec<'env, R> {
+    make: MakeUndo<'env, R>,
+    max_retries: u32,
+    exhausted: Option<MakeExhausted<'env, R>>,
 }
 
-impl<'transaction, 'env, Op> StepWithUndo<'transaction, 'env, Op> {
+/// Builds the exhausted hook once the step's result is known
+type MakeExhausted<'env, R> = Box<dyn FnOnce(&R) -> ExhaustedFn<'env> + Send + 'env>;
+
+/// StepWithUndo: a `Step` with an undo handler to unwind operations when later steps fail
+pub struct StepWithUndo<'transaction, 'env, Op, R> {
+    step: Step<'transaction, 'env, Op>,
+    undo: UndoSpec<'env, R>,
+}
+
+impl<'transaction, 'env, Op, R> StepWithUndo<'transaction, 'env, Op, R> {
     /// Set the number of retries for the operation if it fails initially
     pub fn with_retries(mut self, num_retries: u32) -> Self {
         self.step = self.step.with_retries(num_retries);
@@ -154,6 +180,26 @@ impl<'transaction, 'env, Op> StepWithUndo<'transaction, 'env, Op> {
         self.undo.max_retries = num_retries;
         self
     }
+
+    /// Register a hook that runs once if the undo still fails after all of its retries
+    ///
+    /// The hook receives a clone of the result of the step.
+    /// Unwinding continues with the remaining undos after it completes.
+    /// The hook should not panic.
+    pub fn on_undo_exhausted<H, Fut>(mut self, hook: H) -> Self
+    where
+        R: Clone + Send + 'env,
+        H: FnOnce(R) -> Fut + Send + 'env,
+        Fut: Future<Output = ()> + Send + 'env,
+    {
+        let make: MakeExhausted<'env, R> = Box::new(move |result: &R| {
+            let result = result.clone();
+            let exhausted: ExhaustedFn<'env> = Box::new(move || Box::pin(hook(result)));
+            exhausted
+        });
+        self.undo.exhausted = Some(make);
+        self
+    }
 }
 
 /// Run a step of the transaction with exponential backoff (if any)
@@ -162,7 +208,7 @@ impl<'transaction, 'env, Op> StepWithUndo<'transaction, 'env, Op> {
 /// if we fail, we unwind the transaction
 async fn run_step<'env, Op, Fut, R, E>(
     step: Step<'_, 'env, Op>,
-    undo: Option<Undo<'env>>,
+    undo: Option<UndoSpec<'env, R>>,
 ) -> Result<R, TransactionError<E>>
 where
     Op: FnMut() -> Fut,
@@ -177,8 +223,12 @@ where
     match retry_with_backoff(operation, max_retries).await {
         Ok(res) => {
             // register the undo handler in the transaction if we're done
-            if let Some(undo) = undo {
-                transaction.stack.push(undo);
+            if let Some(spec) = undo {
+                transaction.stack.push(Undo {
+                    handler: (spec.make)(&res),
+                    max_retries: spec.max_retries,
+                    exhausted: spec.exhausted.map(|make| make(&res)),
+                });
             }
             Ok(res)
         }
@@ -211,7 +261,7 @@ where
 /// Implementation of `IntoFuture` for `StepWithUndo`
 ///
 /// Used to force execution of the step with `.await`
-impl<'transaction, 'env, Op, Fut, R, E> IntoFuture for StepWithUndo<'transaction, 'env, Op>
+impl<'transaction, 'env, Op, Fut, R, E> IntoFuture for StepWithUndo<'transaction, 'env, Op, R>
 where
     Op: FnMut() -> Fut + Send + 'transaction,
     Fut: Future<Output = Result<R, E>> + Send + 'transaction,
@@ -271,7 +321,15 @@ impl<'env> Transaction<'env> {
     async fn unwind(&mut self) -> Result<(), Vec<UndoError>> {
         let mut failures = Vec::new();
         while let Some(undo) = self.stack.pop() {
-            if let Err(e) = retry_with_backoff(undo.handler, undo.max_retries).await {
+            let Undo {
+                handler,
+                max_retries,
+                exhausted,
+            } = undo;
+            if let Err(e) = retry_with_backoff(handler, max_retries).await {
+                if let Some(exhausted) = exhausted {
+                    exhausted().await;
+                }
                 failures.push(e);
             }
         }
