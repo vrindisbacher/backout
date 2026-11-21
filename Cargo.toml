@@ -1,6 +1,6 @@
 [package]
 name = "backout"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Run async steps with retries and exponential backoff, undoing completed steps if later steps fail"
 license = "MIT OR Apache-2.0"
