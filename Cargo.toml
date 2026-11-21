@@ -1,0 +1,9 @@
+[package]
+name = "backout"
+version = "0.1.0"
+edition = "2024"
+description = "Run async steps with retries and exponential backoff, undoing completed steps if later steps fail"
+
+[dependencies]
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+tokio = { version = "1.54.1", features = ["rt", "time"] }
