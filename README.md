@@ -28,7 +28,7 @@ At a high level, the `undo` handlers registered with `.undo` guarantee that
 if `reserve` fails, `refund` will run and if `send_receipt` fails, `release` will run,
 followed by `refund`.
 
-Operations are retried are done with exponential backoff, and undos may also retry.
+Operations are retried with exponential backoff, and undos may also retry.
 It is expected that undo handlers with retries are **idempotent**.
 
 ## A note on Web Frameworks
@@ -55,6 +55,6 @@ let receipt = transaction(async move |t| {
 Not all undo handlers run. In particular, the semantics of which handlers run are as follows.
 
 - Steps that completed and have an `undo`, newest first (i.e., reverse execution order).
-- Steps that fail's handlers do not run. **If partial updates** are possible, split each `step` into smaller changes that can be rolled back in a total way.
+- If a step fails, its `undo` handler does not run. **If partial updates** are possible, split each `step` into smaller changes that can be rolled back in a complete way.
 - If a task aborts, the underlying async runtime shuts down, or the build uses `panic = "abort"`, no steps will be unwound.
 
